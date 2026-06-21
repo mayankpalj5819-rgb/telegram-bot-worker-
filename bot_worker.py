@@ -168,7 +168,20 @@ Or just send me any message!"""
         
         print(f"🤖 Bot worker starting...")
         print(f"   HF Space: {HF_SPACE_URL}")
-        self.app.run_polling(drop_pending_updates=True)
+        
+        # FIX: Use asyncio.run() for Python 3.14 compatibility
+        asyncio.run(self._main())
+    
+    async def _main(self):
+        """Async main entry point."""
+        await self.app.initialize()
+        await self.app.start()
+        await self.app.updater.start_polling(drop_pending_updates=True)
+        
+        # Keep running
+        print("✅ Bot is running. Press Ctrl+C to stop.")
+        while True:
+            await asyncio.sleep(3600)
 
 
 if __name__ == "__main__":
