@@ -12,9 +12,11 @@ from telegram.ext import (
     ContextTypes,
     filters
 )
+from aiohttp import web
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 HF_SPACE_URL = os.getenv("HF_SPACE_URL", "https://mayank2028-agent.hf.space")
+PORT = int(os.getenv("PORT", "10000"))
 
 if not TOKEN:
     raise ValueError("TELEGRAM_BOT_TOKEN not set")
@@ -155,7 +157,7 @@ Or just send me any message!"""
         else:
             await query.edit_message_text(f"{header}\n\n{response[:3000]}", parse_mode="Markdown")
     
-    def run(self):
+    async def run(self):
         self.app = Application.builder().token(TOKEN).build()
         
         self.app.add_handler(CommandHandler("start", self.start_cmd))
@@ -169,21 +171,33 @@ Or just send me any message!"""
         print(f"🤖 Bot worker starting...")
         print(f"   HF Space: {HF_SPACE_URL}")
         
-        # FIX: Use asyncio.run() for Python 3.14 compatibility
-        asyncio.run(self._main())
-    
-    async def _main(self):
-        """Async main entry point."""
         await self.app.initialize()
         await self.app.start()
         await self.app.updater.start_polling(drop_pending_updates=True)
-        
-        # Keep running
-        print("✅ Bot is running. Press Ctrl+C to stop.")
-        while True:
-            await asyncio.sleep(3600)
+        print("✅ Bot polling started")
 
+
+# Dummy HTTP server to satisfy Render's port check
+async def health(request):
+    return web.Response(text="Bot is running")
+
+async def main():
+    worker = BotWorker()
+    
+    # Start bot in background
+    bot_task = asyncio.create_task(worker.run())
+    
+    # Start dummy HTTP server
+    server = web.Application()
+    server.router.add_get("/", health)
+    runner = web.AppRunner(server)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    print(f"🌐 Health server running on port {PORT}")
+    
+    # Keep running
+    await bot_task
 
 if __name__ == "__main__":
-    worker = BotWorker()
-    worker.run()
+    asyncio.run(main())
