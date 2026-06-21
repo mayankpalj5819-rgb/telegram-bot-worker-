@@ -3,7 +3,6 @@ import threading
 import asyncio
 import base64
 import json
-import time
 from io import BytesIO
 import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
