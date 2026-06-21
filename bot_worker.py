@@ -4,8 +4,6 @@ import asyncio
 import base64
 import json
 import time
-import signal
-import sys
 from io import BytesIO
 import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -35,14 +33,8 @@ def health():
 class BotWorker:
     def __init__(self):
         self.app: Application = None
-        self._stop_event = asyncio.Event()
 
     async def forward_to_hf(self, text: str, user_id: int = None) -> dict:
-        """
-        Forward message to HF Space /api/chat endpoint.
-        The HF Space expects: {"message": "...", "user_id": "..."}
-        Returns: {"response": "...", "screenshot": "...", "mode": "..."}
-        """
         async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
             try:
                 payload = {
@@ -50,7 +42,8 @@ class BotWorker:
                     "user_id": str(user_id) if user_id else "telegram_user"
                 }
                 
-                print(f"→ Sending to HF Space: {json.dumps(payload)[:200]}")
+                print(f"→ HF Space: {HF_SPACE_URL}/api/chat")
+                print(f"→ Payload: {json.dumps(payload)[:200]}")
                 
                 resp = await client.post(
                     f"{HF_SPACE_URL}/api/chat",
@@ -58,13 +51,12 @@ class BotWorker:
                     timeout=90.0
                 )
                 
-                print(f"← HF Space status: {resp.status_code}")
-                print(f"← HF Space body: {resp.text[:500]}")
+                print(f"← Status: {resp.status_code}")
+                print(f"← Body: {resp.text[:500]}")
                 
                 if resp.status_code == 200:
                     try:
                         data = resp.json()
-                        # Handle both error and success responses
                         if "error" in data:
                             return {
                                 "response": f"❌ HF Space error: {data['error']}",
@@ -78,7 +70,7 @@ class BotWorker:
                         }
                     except Exception as e:
                         return {
-                            "response": f"❌ Invalid JSON from HF Space: {str(e)}\nRaw: {resp.text[:300]}",
+                            "response": f"❌ Invalid JSON: {str(e)}\nRaw: {resp.text[:300]}",
                             "screenshot": "",
                             "mode": "error"
                         }
@@ -199,12 +191,10 @@ Or just send me any message!"""
     async def _send_result(self, update: Update, msg, result: dict, header: str, reply_markup=None):
         response = result.get("response", "No response")
         screenshot = result.get("screenshot", "")
-        mode = result.get("mode", "chat")
 
         if not isinstance(response, str):
             response = str(response)
 
-        # Handle screenshot + text response
         if screenshot and isinstance(screenshot, str) and "," in screenshot:
             try:
                 img_data = base64.b64decode(screenshot.split(",")[1])
@@ -251,7 +241,6 @@ Or just send me any message!"""
                 await query.message.reply_text(f"{header}\n\n{response[:3000]}", parse_mode="Markdown")
 
     async def run_async(self):
-        """Async entry point with proper shutdown handling."""
         self.app = Application.builder().token(TOKEN).build()
 
         self.app.add_handler(CommandHandler("start", self.start_cmd))
@@ -265,48 +254,21 @@ Or just send me any message!"""
         print(f"🤖 Bot worker starting...")
         print(f"🔗 HF Space: {HF_SPACE_URL}")
 
-        # Test connection to HF Space on startup
-        print("🔍 Testing HF Space connection...")
-        test_result = await self.forward_to_hf("Hello", 0)
-        print(f"Test result: {test_result.get('response', 'No response')[:200]}")
-
         await self.app.initialize()
         await self.app.start()
-        await self.app.updater.start_polling(
-            drop_pending_updates=True,
-            allowed_updates=Update.ALL_TYPES
-        )
+        await self.app.updater.start_polling(drop_pending_updates=True)
 
         print("✅ Bot polling started")
-        
-        try:
-            while not self._stop_event.is_set():
-                await asyncio.wait_for(self._stop_event.wait(), timeout=1.0)
-        except asyncio.TimeoutError:
-            pass
-        
-        print("🛑 Shutting down bot...")
-        await self.app.updater.stop()
-        await self.app.stop()
-        await self.app.shutdown()
-        print("✅ Bot stopped")
 
-    def stop(self):
-        self._stop_event.set()
+        while True:
+            await asyncio.sleep(3600)
+
 
 def run_bot():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
     worker = BotWorker()
-    
-    def signal_handler(signum, frame):
-        print(f"Received signal {signum}, stopping bot...")
-        worker.stop()
-    
-    signal.signal(signal.SIGTERM, signal_handler)
-    signal.signal(signal.SIGINT, signal_handler)
-    
     try:
         loop.run_until_complete(worker.run_async())
     except Exception as e:
@@ -315,6 +277,7 @@ def run_bot():
         print(traceback.format_exc())
     finally:
         loop.close()
+
 
 if __name__ == "__main__":
     bot_thread = threading.Thread(target=run_bot, daemon=True)
