@@ -1,5 +1,5 @@
 import os
-import asyncio
+import threading
 import base64
 from io import BytesIO
 import httpx
@@ -12,7 +12,7 @@ from telegram.ext import (
     ContextTypes,
     filters
 )
-from aiohttp import web
+from flask import Flask
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 HF_SPACE_URL = os.getenv("HF_SPACE_URL", "https://mayank2028-agent.hf.space")
@@ -20,6 +20,13 @@ PORT = int(os.getenv("PORT", "10000"))
 
 if not TOKEN:
     raise ValueError("TELEGRAM_BOT_TOKEN not set")
+
+# Flask app for Render health check
+flask_app = Flask(__name__)
+
+@flask_app.route("/")
+def health():
+    return "Bot is running", 200
 
 class BotWorker:
     def __init__(self):
@@ -157,7 +164,7 @@ Or just send me any message!"""
         else:
             await query.edit_message_text(f"{header}\n\n{response[:3000]}", parse_mode="Markdown")
     
-    async def run(self):
+    def run(self):
         self.app = Application.builder().token(TOKEN).build()
         
         self.app.add_handler(CommandHandler("start", self.start_cmd))
@@ -170,34 +177,20 @@ Or just send me any message!"""
         
         print(f"🤖 Bot worker starting...")
         print(f"   HF Space: {HF_SPACE_URL}")
-        
-        await self.app.initialize()
-        await self.app.start()
-        await self.app.updater.start_polling(drop_pending_updates=True)
-        print("✅ Bot polling started")
+        self.app.run_polling(drop_pending_updates=True)
 
 
-# Dummy HTTP server to satisfy Render's port check
-async def health(request):
-    return web.Response(text="Bot is running")
-
-async def main():
+def run_bot():
+    """Run bot in a thread."""
     worker = BotWorker()
-    
-    # Start bot in background
-    bot_task = asyncio.create_task(worker.run())
-    
-    # Start dummy HTTP server
-    server = web.Application()
-    server.router.add_get("/", health)
-    runner = web.AppRunner(server)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-    print(f"🌐 Health server running on port {PORT}")
-    
-    # Keep running
-    await bot_task
+    worker.run()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Start bot in background thread
+    bot_thread = threading.Thread(target=run_bot, daemon=True)
+    bot_thread.start()
+    print("🤖 Bot thread started")
+    
+    # Start Flask server for Render health check
+    print(f"🌐 Starting health server on port {PORT}")
+    flask_app.run(host="0.0.0.0", port=PORT, threaded=True)
