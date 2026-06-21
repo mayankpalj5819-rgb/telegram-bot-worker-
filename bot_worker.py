@@ -36,78 +36,73 @@ class BotWorker:
     def __init__(self):
         self.app: Application = None
         self._stop_event = asyncio.Event()
-        self.last_request_time = 0
-        self.session_timeout = 300  # 5 minutes
 
     async def forward_to_hf(self, text: str, user_id: int = None) -> dict:
-        """Forward message to HF Space with proper error handling."""
+        """
+        Forward message to HF Space /api/chat endpoint.
+        The HF Space expects: {"message": "...", "user_id": "..."}
+        Returns: {"response": "...", "screenshot": "...", "mode": "..."}
+        """
         async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
             try:
-                current_time = time.time()
+                payload = {
+                    "message": text,
+                    "user_id": str(user_id) if user_id else "telegram_user"
+                }
                 
-                # Try the main API endpoint
+                print(f"→ Sending to HF Space: {json.dumps(payload)[:200]}")
+                
                 resp = await client.post(
                     f"{HF_SPACE_URL}/api/chat",
-                    json={"message": text, "user_id": str(user_id) if user_id else "default"},
+                    json=payload,
                     timeout=90.0
                 )
                 
-                print(f"API Response Status: {resp.status_code}")
-                print(f"API Response Body (first 500 chars): {resp.text[:500]}")
+                print(f"← HF Space status: {resp.status_code}")
+                print(f"← HF Space body: {resp.text[:500]}")
                 
                 if resp.status_code == 200:
                     try:
                         data = resp.json()
-                        self.last_request_time = current_time
-                        return data
-                    except:
-                        return {"response": resp.text, "screenshot": ""}
+                        # Handle both error and success responses
+                        if "error" in data:
+                            return {
+                                "response": f"❌ HF Space error: {data['error']}",
+                                "screenshot": "",
+                                "mode": "error"
+                            }
+                        return {
+                            "response": data.get("response", "No response"),
+                            "screenshot": data.get("screenshot", ""),
+                            "mode": data.get("mode", "chat")
+                        }
+                    except Exception as e:
+                        return {
+                            "response": f"❌ Invalid JSON from HF Space: {str(e)}\nRaw: {resp.text[:300]}",
+                            "screenshot": "",
+                            "mode": "error"
+                        }
                 else:
-                    return await self._try_alternative_endpoints(client, text, user_id)
+                    return {
+                        "response": f"❌ HF Space returned {resp.status_code}: {resp.text[:300]}",
+                        "screenshot": "",
+                        "mode": "error"
+                    }
                     
             except httpx.TimeoutException:
                 return {
                     "response": "⏱️ Request timed out. The HF Space might be waking up from sleep (cold start takes ~30-60s). Please try again!",
-                    "screenshot": ""
+                    "screenshot": "",
+                    "mode": "error"
                 }
             except Exception as e:
                 import traceback
                 print(f"Error in forward_to_hf: {traceback.format_exc()}")
                 return {
-                    "response": f"❌ Error connecting to HF Space: {str(e)[:200]}",
-                    "screenshot": ""
+                    "response": f"❌ Error: {str(e)[:200]}",
+                    "screenshot": "",
+                    "mode": "error"
                 }
-
-    async def _try_alternative_endpoints(self, client, text, user_id):
-        """Try different API endpoints if the main one fails."""
-        endpoints_to_try = [
-            ("/api/predict", {"data": [text]}),
-            ("/gradio_api/call/predict", {"data": [text]}),
-            ("/predict", {"message": text}),
-            ("/chat", {"message": text}),
-        ]
-        
-        for endpoint, payload in endpoints_to_try:
-            try:
-                print(f"Trying alternative endpoint: {endpoint}")
-                resp = await client.post(
-                    f"{HF_SPACE_URL}{endpoint}",
-                    json=payload,
-                    timeout=30.0
-                )
-                if resp.status_code == 200:
-                    try:
-                        return resp.json()
-                    except:
-                        return {"response": resp.text, "screenshot": ""}
-            except Exception as e:
-                print(f"  {endpoint} failed: {e}")
-                continue
-        
-        return {
-            "response": "❌ Could not connect to HF Space. All endpoints failed.",
-            "screenshot": ""
-        }
 
     async def start_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         welcome = """🤖 *AI Agent Browser Bot*
@@ -159,21 +154,19 @@ Or just send me any message!"""
         await self._send_result(update, msg, result, "📸 Screenshot")
 
     async def status_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=15.0) as client:
             try:
-                for endpoint in ["/health", "/gradio_api/heartbeat", "/"]:
-                    try:
-                        resp = await client.get(f"{HF_SPACE_URL}{endpoint}", timeout=5.0)
-                        if resp.status_code == 200:
-                            await update.message.reply_text(
-                                f"🤖 *HF Space Status*\n\n✅ Online (responded to {endpoint})",
-                                parse_mode="Markdown"
-                            )
-                            return
-                    except:
-                        continue
-                        
-                await update.message.reply_text("❌ HF Space unreachable", parse_mode="Markdown")
+                resp = await client.get(f"{HF_SPACE_URL}/health", timeout=10.0)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    status = "✅ Online" if data.get("status") == "ok" else "❌ Issue"
+                    browser = "🟢 Active" if data.get("browser_active") else "🔴 Inactive"
+                    await update.message.reply_text(
+                        f"🤖 *HF Space Status*\n\n{status}\n🌐 Browser: {browser}",
+                        parse_mode="Markdown"
+                    )
+                else:
+                    await update.message.reply_text(f"❌ HF Space returned {resp.status_code}")
             except Exception as e:
                 await update.message.reply_text(f"❌ HF Space unreachable:\n```\n{str(e)[:200]}\n```", parse_mode="Markdown")
 
@@ -206,22 +199,12 @@ Or just send me any message!"""
     async def _send_result(self, update: Update, msg, result: dict, header: str, reply_markup=None):
         response = result.get("response", "No response")
         screenshot = result.get("screenshot", "")
-        
-        if not response and "data" in result:
-            response = str(result["data"])
-        if not response and "output" in result:
-            response = str(result["output"])
+        mode = result.get("mode", "chat")
 
         if not isinstance(response, str):
             response = str(response)
 
-        # Detect stale Wikipedia responses
-        if "wikipedia" in response.lower() and "wikipedia" not in header.lower():
-            if hasattr(update, 'message') and update.message:
-                user_text = update.message.text or ""
-                if "wikipedia" not in user_text.lower():
-                    response = "⚠️ The agent returned a stale response. The browser may still have Wikipedia loaded from a previous session.\n\nTry: /browse <new-url> to navigate elsewhere first."
-
+        # Handle screenshot + text response
         if screenshot and isinstance(screenshot, str) and "," in screenshot:
             try:
                 img_data = base64.b64decode(screenshot.split(",")[1])
@@ -242,13 +225,12 @@ Or just send me any message!"""
             try:
                 await msg.edit_text(f"{header}\n\n{response[:3000]}", reply_markup=reply_markup, parse_mode="Markdown")
             except Exception as e:
-                print(f"Edit message error: {e}")
                 await update.message.reply_text(f"{header}\n\n{response[:3000]}", reply_markup=reply_markup)
 
     async def _send_result_to_query(self, query, result: dict, header: str):
         response = result.get("response", "No response")
         screenshot = result.get("screenshot", "")
-        
+
         if not isinstance(response, str):
             response = str(response)
 
@@ -283,6 +265,11 @@ Or just send me any message!"""
         print(f"🤖 Bot worker starting...")
         print(f"🔗 HF Space: {HF_SPACE_URL}")
 
+        # Test connection to HF Space on startup
+        print("🔍 Testing HF Space connection...")
+        test_result = await self.forward_to_hf("Hello", 0)
+        print(f"Test result: {test_result.get('response', 'No response')[:200]}")
+
         await self.app.initialize()
         await self.app.start()
         await self.app.updater.start_polling(
@@ -292,14 +279,12 @@ Or just send me any message!"""
 
         print("✅ Bot polling started")
         
-        # Keep running until stop event is set
         try:
             while not self._stop_event.is_set():
                 await asyncio.wait_for(self._stop_event.wait(), timeout=1.0)
         except asyncio.TimeoutError:
             pass
         
-        # Graceful shutdown
         print("🛑 Shutting down bot...")
         await self.app.updater.stop()
         await self.app.stop()
@@ -307,17 +292,14 @@ Or just send me any message!"""
         print("✅ Bot stopped")
 
     def stop(self):
-        """Signal the bot to stop."""
         self._stop_event.set()
 
 def run_bot():
-    """Run bot in a thread with its own event loop."""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
     worker = BotWorker()
     
-    # Handle signals for graceful shutdown
     def signal_handler(signum, frame):
         print(f"Received signal {signum}, stopping bot...")
         worker.stop()
