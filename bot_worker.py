@@ -4,6 +4,8 @@ import asyncio
 import base64
 import json
 import time
+import signal
+import sys
 from io import BytesIO
 import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -33,28 +35,17 @@ def health():
 class BotWorker:
     def __init__(self):
         self.app: Application = None
-        # Track last request time to detect stale sessions
+        self._stop_event = asyncio.Event()
         self.last_request_time = 0
         self.session_timeout = 300  # 5 minutes
 
     async def forward_to_hf(self, text: str, user_id: int = None) -> dict:
-        """
-        Forward message to HF Space.
-        The Space is a browser agent that maintains state.
-        We need to handle: reset, screenshot, and text response.
-        """
+        """Forward message to HF Space with proper error handling."""
         async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
             try:
-                # First, try to reset the browser if session is stale
-                # or if this is a new conversation
                 current_time = time.time()
-                session_stale = (current_time - self.last_request_time) > self.session_timeout
                 
-                # Try to call the Space API
-                # Based on your working screenshot, the endpoint seems to be /api/chat or similar
-                # Let's try multiple approaches
-                
-                # Approach 1: Try the custom API endpoint (what you had)
+                # Try the main API endpoint
                 resp = await client.post(
                     f"{HF_SPACE_URL}/api/chat",
                     json={"message": text, "user_id": str(user_id) if user_id else "default"},
@@ -62,7 +53,6 @@ class BotWorker:
                 )
                 
                 print(f"API Response Status: {resp.status_code}")
-                print(f"API Response Headers: {dict(resp.headers)}")
                 print(f"API Response Body (first 500 chars): {resp.text[:500]}")
                 
                 if resp.status_code == 200:
@@ -71,10 +61,8 @@ class BotWorker:
                         self.last_request_time = current_time
                         return data
                     except:
-                        # Not JSON, maybe it's text
                         return {"response": resp.text, "screenshot": ""}
                 else:
-                    # Try alternative endpoints
                     return await self._try_alternative_endpoints(client, text, user_id)
                     
             except httpx.TimeoutException:
@@ -84,8 +72,7 @@ class BotWorker:
                 }
             except Exception as e:
                 import traceback
-                error_detail = traceback.format_exc()
-                print(f"Error in forward_to_hf: {error_detail}")
+                print(f"Error in forward_to_hf: {traceback.format_exc()}")
                 return {
                     "response": f"❌ Error connecting to HF Space: {str(e)[:200]}",
                     "screenshot": ""
@@ -174,7 +161,6 @@ Or just send me any message!"""
     async def status_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         async with httpx.AsyncClient(timeout=10.0) as client:
             try:
-                # Try multiple health endpoints
                 for endpoint in ["/health", "/gradio_api/heartbeat", "/"]:
                     try:
                         resp = await client.get(f"{HF_SPACE_URL}{endpoint}", timeout=5.0)
@@ -221,23 +207,23 @@ Or just send me any message!"""
         response = result.get("response", "No response")
         screenshot = result.get("screenshot", "")
         
-        # Handle case where response might be nested
         if not response and "data" in result:
             response = str(result["data"])
         if not response and "output" in result:
             response = str(result["output"])
 
-        # Ensure response is string
         if not isinstance(response, str):
             response = str(response)
 
-        # Clean up stale Wikipedia responses for non-wikipedia queries
-        if "wikipedia" in response.lower() and "wikipedia" not in header.lower() and "wikipedia" not in str(getattr(update, 'message', {}).get('text', '') if hasattr(update, 'message') else '').lower():
-            response = "⚠️ The agent returned a stale response. The browser may still have Wikipedia loaded from a previous session.\n\nTry: /browse <new-url> to navigate elsewhere first."
+        # Detect stale Wikipedia responses
+        if "wikipedia" in response.lower() and "wikipedia" not in header.lower():
+            if hasattr(update, 'message') and update.message:
+                user_text = update.message.text or ""
+                if "wikipedia" not in user_text.lower():
+                    response = "⚠️ The agent returned a stale response. The browser may still have Wikipedia loaded from a previous session.\n\nTry: /browse <new-url> to navigate elsewhere first."
 
         if screenshot and isinstance(screenshot, str) and "," in screenshot:
             try:
-                # Handle base64 data URL format: data:image/png;base64,...
                 img_data = base64.b64decode(screenshot.split(",")[1])
                 await msg.delete()
                 await update.message.reply_photo(
@@ -283,7 +269,7 @@ Or just send me any message!"""
                 await query.message.reply_text(f"{header}\n\n{response[:3000]}", parse_mode="Markdown")
 
     async def run_async(self):
-        """Async entry point."""
+        """Async entry point with proper shutdown handling."""
         self.app = Application.builder().token(TOKEN).build()
 
         self.app.add_handler(CommandHandler("start", self.start_cmd))
@@ -299,11 +285,30 @@ Or just send me any message!"""
 
         await self.app.initialize()
         await self.app.start()
-        await self.app.updater.start_polling(drop_pending_updates=True)
+        await self.app.updater.start_polling(
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES
+        )
 
         print("✅ Bot polling started")
-        while True:
-            await asyncio.sleep(3600)
+        
+        # Keep running until stop event is set
+        try:
+            while not self._stop_event.is_set():
+                await asyncio.wait_for(self._stop_event.wait(), timeout=1.0)
+        except asyncio.TimeoutError:
+            pass
+        
+        # Graceful shutdown
+        print("🛑 Shutting down bot...")
+        await self.app.updater.stop()
+        await self.app.stop()
+        await self.app.shutdown()
+        print("✅ Bot stopped")
+
+    def stop(self):
+        """Signal the bot to stop."""
+        self._stop_event.set()
 
 def run_bot():
     """Run bot in a thread with its own event loop."""
@@ -311,6 +316,15 @@ def run_bot():
     asyncio.set_event_loop(loop)
 
     worker = BotWorker()
+    
+    # Handle signals for graceful shutdown
+    def signal_handler(signum, frame):
+        print(f"Received signal {signum}, stopping bot...")
+        worker.stop()
+    
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+    
     try:
         loop.run_until_complete(worker.run_async())
     except Exception as e:
