@@ -34,7 +34,7 @@ class BotWorker:
         self.app: Application = None
 
     async def forward_to_hf(self, text: str, user_id: int = None) -> dict:
-        async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=180.0, follow_redirects=True) as client:
             try:
                 payload = {
                     "message": text,
@@ -42,16 +42,14 @@ class BotWorker:
                 }
                 
                 print(f"→ HF Space: {HF_SPACE_URL}/api/chat")
-                print(f"→ Payload: {json.dumps(payload)[:200]}")
                 
                 resp = await client.post(
                     f"{HF_SPACE_URL}/api/chat",
                     json=payload,
-                    timeout=90.0
+                    timeout=120.0
                 )
                 
                 print(f"← Status: {resp.status_code}")
-                print(f"← Body: {resp.text[:500]}")
                 
                 if resp.status_code == 200:
                     try:
@@ -60,23 +58,27 @@ class BotWorker:
                             return {
                                 "response": f"❌ HF Space error: {data['error']}",
                                 "screenshot": "",
+                                "step_screenshots": [],
                                 "mode": "error"
                             }
                         return {
                             "response": data.get("response", "No response"),
                             "screenshot": data.get("screenshot", ""),
+                            "step_screenshots": data.get("step_screenshots", []),
                             "mode": data.get("mode", "chat")
                         }
                     except Exception as e:
                         return {
-                            "response": f"❌ Invalid JSON: {str(e)}\nRaw: {resp.text[:300]}",
+                            "response": f"❌ Invalid JSON: {str(e)}",
                             "screenshot": "",
+                            "step_screenshots": [],
                             "mode": "error"
                         }
                 else:
                     return {
                         "response": f"❌ HF Space returned {resp.status_code}: {resp.text[:300]}",
                         "screenshot": "",
+                        "step_screenshots": [],
                         "mode": "error"
                     }
                     
@@ -84,6 +86,7 @@ class BotWorker:
                 return {
                     "response": "⏱️ Request timed out. The HF Space might be waking up from sleep (cold start takes ~30-60s). Please try again!",
                     "screenshot": "",
+                    "step_screenshots": [],
                     "mode": "error"
                 }
             except Exception as e:
@@ -92,6 +95,7 @@ class BotWorker:
                 return {
                     "response": f"❌ Error: {str(e)[:200]}",
                     "screenshot": "",
+                    "step_screenshots": [],
                     "mode": "error"
                 }
 
@@ -123,7 +127,7 @@ Or just send me any message!"""
         msg = await update.message.reply_text(f"🌐 Browsing {url}...")
 
         result = await self.forward_to_hf(f"Go to {url} and summarize what you see", update.effective_user.id)
-        await self._send_result(update, msg, result, f"🌐 {url[:50]}")
+        await self._send_result_with_steps(update, msg, result, f"🌐 {url[:50]}")
 
     async def search_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not context.args:
@@ -135,14 +139,14 @@ Or just send me any message!"""
         msg = await update.message.reply_text(f"🔍 Searching: {query}...")
 
         result = await self.forward_to_hf(f"Search for {query}", update.effective_user.id)
-        await self._send_result(update, msg, result, f"🔍 {query}")
+        await self._send_result_with_steps(update, msg, result, f"🔍 {query}")
 
     async def screenshot_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.chat.send_action(action="upload_photo")
         msg = await update.message.reply_text("📸 Getting screenshot...")
 
         result = await self.forward_to_hf("Take a screenshot of the current page", update.effective_user.id)
-        await self._send_result(update, msg, result, "📸 Screenshot")
+        await self._send_result_with_steps(update, msg, result, "📸 Screenshot")
 
     async def status_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         async with httpx.AsyncClient(timeout=15.0) as client:
@@ -173,7 +177,7 @@ Or just send me any message!"""
         keyboard = [[InlineKeyboardButton("🌐 Browse for this", callback_data=f"browse:{text[:100]}")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
-        await self._send_result(update, msg, result, "🤖 AI Agent", reply_markup)
+        await self._send_result_with_steps(update, msg, result, "🤖 AI Agent", reply_markup)
 
     async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
@@ -185,19 +189,54 @@ Or just send me any message!"""
             await query.edit_message_text(f"🌐 Browsing: {search_query}...")
 
             result = await self.forward_to_hf(search_query, update.effective_user.id)
-            await self._send_result_to_query(query, result, f"🌐 {search_query[:50]}")
+            await self._send_result_to_query_with_steps(query, result, f"🌐 {search_query[:50]}")
 
-    async def _send_result(self, update: Update, msg, result: dict, header: str, reply_markup=None):
+    async def _send_result_with_steps(self, update: Update, msg, result: dict, header: str, reply_markup=None):
+        """Send result with all step screenshots as a media group."""
         response = result.get("response", "No response")
-        screenshot = result.get("screenshot", "")
+        step_screenshots = result.get("step_screenshots", [])
+        final_screenshot = result.get("screenshot", "")
 
         if not isinstance(response, str):
             response = str(response)
 
-        if screenshot and isinstance(screenshot, str) and "," in screenshot:
+        # Delete the "Thinking..." message
+        try:
+            await msg.delete()
+        except:
+            pass
+
+        # Send step screenshots as media group (max 10 per group)
+        from telegram import InputMediaPhoto
+        
+        if step_screenshots:
+            media_group = []
+            for i, step in enumerate(step_screenshots[:10]):  # Limit to 10
+                ss = step.get("screenshot", "")
+                action = step.get("action", "step")
+                step_num = step.get("step", i+1)
+                
+                if ss and isinstance(ss, str) and "," in ss:
+                    try:
+                        img_data = base64.b64decode(ss.split(",")[1])
+                        caption = f"Step {step_num}: {action}" if i == 0 else ""
+                        media_group.append(InputMediaPhoto(
+                            media=BytesIO(img_data),
+                            caption=caption
+                        ))
+                    except Exception as e:
+                        print(f"Step screenshot decode error: {e}")
+            
+            if media_group:
+                try:
+                    await update.message.reply_media_group(media=media_group)
+                except Exception as e:
+                    print(f"Media group error: {e}")
+
+        # Send final screenshot with full response
+        if final_screenshot and isinstance(final_screenshot, str) and "," in final_screenshot:
             try:
-                img_data = base64.b64decode(screenshot.split(",")[1])
-                await msg.delete()
+                img_data = base64.b64decode(final_screenshot.split(",")[1])
                 await update.message.reply_photo(
                     photo=BytesIO(img_data),
                     caption=f"{header}\n\n{response[:900]}",
@@ -205,27 +244,51 @@ Or just send me any message!"""
                     parse_mode="Markdown"
                 )
             except Exception as e:
-                print(f"Screenshot error: {e}")
-                try:
-                    await msg.edit_text(f"{header}\n\n{response[:3000]}\n\n⚠️ Screenshot error", parse_mode="Markdown")
-                except:
-                    await update.message.reply_text(f"{header}\n\n{response[:3000]}", reply_markup=reply_markup)
-        else:
-            try:
-                await msg.edit_text(f"{header}\n\n{response[:3000]}", reply_markup=reply_markup, parse_mode="Markdown")
-            except Exception as e:
+                print(f"Final screenshot error: {e}")
                 await update.message.reply_text(f"{header}\n\n{response[:3000]}", reply_markup=reply_markup)
+        else:
+            await update.message.reply_text(f"{header}\n\n{response[:3000]}", reply_markup=reply_markup)
 
-    async def _send_result_to_query(self, query, result: dict, header: str):
+    async def _send_result_to_query_with_steps(self, query, result: dict, header: str):
+        """Send callback result with step screenshots."""
         response = result.get("response", "No response")
-        screenshot = result.get("screenshot", "")
+        step_screenshots = result.get("step_screenshots", [])
+        final_screenshot = result.get("screenshot", "")
 
         if not isinstance(response, str):
             response = str(response)
 
-        if screenshot and isinstance(screenshot, str) and "," in screenshot:
+        from telegram import InputMediaPhoto
+        
+        # Send step screenshots
+        if step_screenshots:
+            media_group = []
+            for i, step in enumerate(step_screenshots[:10]):
+                ss = step.get("screenshot", "")
+                action = step.get("action", "step")
+                step_num = step.get("step", i+1)
+                
+                if ss and isinstance(ss, str) and "," in ss:
+                    try:
+                        img_data = base64.b64decode(ss.split(",")[1])
+                        caption = f"Step {step_num}: {action}" if i == 0 else ""
+                        media_group.append(InputMediaPhoto(
+                            media=BytesIO(img_data),
+                            caption=caption
+                        ))
+                    except:
+                        pass
+            
+            if media_group:
+                try:
+                    await query.message.reply_media_group(media=media_group)
+                except:
+                    pass
+
+        # Send final result
+        if final_screenshot and isinstance(final_screenshot, str) and "," in final_screenshot:
             try:
-                img_data = base64.b64decode(screenshot.split(",")[1])
+                img_data = base64.b64decode(final_screenshot.split(",")[1])
                 await query.message.reply_photo(
                     photo=BytesIO(img_data),
                     caption=f"{header}\n\n{response[:900]}",
@@ -236,7 +299,7 @@ Or just send me any message!"""
         else:
             try:
                 await query.edit_message_text(f"{header}\n\n{response[:3000]}", parse_mode="Markdown")
-            except Exception as e:
+            except:
                 await query.message.reply_text(f"{header}\n\n{response[:3000]}", parse_mode="Markdown")
 
     async def run_async(self):
