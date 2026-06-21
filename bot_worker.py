@@ -1,5 +1,6 @@
 import os
 import threading
+import asyncio
 import base64
 from io import BytesIO
 import httpx
@@ -21,7 +22,6 @@ PORT = int(os.getenv("PORT", "10000"))
 if not TOKEN:
     raise ValueError("TELEGRAM_BOT_TOKEN not set")
 
-# Flask app for Render health check
 flask_app = Flask(__name__)
 
 @flask_app.route("/")
@@ -164,7 +164,8 @@ Or just send me any message!"""
         else:
             await query.edit_message_text(f"{header}\n\n{response[:3000]}", parse_mode="Markdown")
     
-    def run(self):
+    async def run_async(self):
+        """Async entry point."""
         self.app = Application.builder().token(TOKEN).build()
         
         self.app.add_handler(CommandHandler("start", self.start_cmd))
@@ -177,13 +178,30 @@ Or just send me any message!"""
         
         print(f"🤖 Bot worker starting...")
         print(f"   HF Space: {HF_SPACE_URL}")
-        self.app.run_polling(drop_pending_updates=True)
+        
+        await self.app.initialize()
+        await self.app.start()
+        await self.app.updater.start_polling(drop_pending_updates=True)
+        
+        print("✅ Bot polling started")
+        # Keep running
+        while True:
+            await asyncio.sleep(3600)
 
 
 def run_bot():
-    """Run bot in a thread."""
+    """Run bot in a thread with its own event loop."""
+    # FIX: Create new event loop for this thread
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
     worker = BotWorker()
-    worker.run()
+    try:
+        loop.run_until_complete(worker.run_async())
+    except Exception as e:
+        print(f"Bot error: {e}")
+    finally:
+        loop.close()
 
 if __name__ == "__main__":
     # Start bot in background thread
