@@ -3,6 +3,7 @@ import threading
 import asyncio
 import base64
 import json
+import time
 from io import BytesIO
 import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -32,144 +33,94 @@ def health():
 class BotWorker:
     def __init__(self):
         self.app: Application = None
+        # Track last request time to detect stale sessions
+        self.last_request_time = 0
+        self.session_timeout = 300  # 5 minutes
 
-    async def discover_api(self) -> dict:
-        """Discover available Gradio API endpoints."""
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            try:
-                resp = await client.get(f"{HF_SPACE_URL}/gradio_api/info")
-                if resp.status_code == 200:
-                    return resp.json()
-            except Exception as e:
-                print(f"API discovery error: {e}")
-        return {}
-
-    async def gradio_predict(self, text: str) -> dict:
+    async def forward_to_hf(self, text: str, user_id: int = None) -> dict:
         """
-        Use Gradio's async API to call the Space.
-        Gradio uses: POST /gradio_api/call/<endpoint> -> returns event_id
-        Then poll: GET /gradio_api/call/<endpoint>/<event_id>
+        Forward message to HF Space.
+        The Space is a browser agent that maintains state.
+        We need to handle: reset, screenshot, and text response.
         """
-        # First, try to discover the correct endpoint
-        api_info = await self.discover_api()
-        print(f"API Info: {json.dumps(api_info)[:500]}")
-
-        # Try common endpoint names for agent/chat spaces
-        possible_endpoints = ["/chat", "/predict", "/agent", "/run"]
-        
-        # If we can find endpoints from API info, use those
-        if "named_endpoints" in api_info:
-            endpoints = list(api_info["named_endpoints"].keys())
-            if endpoints:
-                possible_endpoints = endpoints + possible_endpoints
-        
-        async with httpx.AsyncClient(timeout=90.0) as client:
-            for endpoint in possible_endpoints:
-                try:
-                    print(f"Trying endpoint: {endpoint}")
-                    
-                    # Step 1: Submit job
-                    submit_url = f"{HF_SPACE_URL}/gradio_api/call{endpoint}"
-                    resp = await client.post(
-                        submit_url,
-                        json={"data": [text]},  # Gradio expects data array
-                        timeout=30.0
-                    )
-                    
-                    if resp.status_code != 200:
-                        print(f"  Status {resp.status_code}: {resp.text[:200]}")
-                        continue
-                    
-                    result_data = resp.json()
-                    event_id = result_data.get("event_id")
-                    
-                    if not event_id:
-                        print(f"  No event_id in response: {result_data}")
-                        continue
-                    
-                    print(f"  Got event_id: {event_id}")
-                    
-                    # Step 2: Poll for result
-                    poll_url = f"{HF_SPACE_URL}/gradio_api/call{endpoint}/{event_id}"
-                    max_polls = 60  # 30 seconds max
-                    
-                    for _ in range(max_polls):
-                        poll_resp = await client.get(poll_url, timeout=30.0)
-                        poll_data = poll_resp.json()
-                        
-                        status = poll_data.get("status")
-                        print(f"  Poll status: {status}")
-                        
-                        if status == "complete":
-                            output = poll_data.get("output", {})
-                            data = output.get("data", [])
-                            if data and len(data) > 0:
-                                response_text = str(data[0]) if data[0] is not None else "No response"
-                            else:
-                                response_text = str(output) if output else "No response"
-                            
-                            return {
-                                "response": response_text,
-                                "screenshot": ""
-                            }
-                        
-                        elif status == "error":
-                            return {
-                                "response": f"❌ Space error: {poll_data.get('message', 'Unknown error')}",
-                                "screenshot": ""
-                            }
-                        
-                        elif status in ("pending", "generating"):
-                            await asyncio.sleep(0.5)
-                            continue
-                        else:
-                            # Unknown status, keep polling
-                            await asyncio.sleep(0.5)
-                    
-                    return {
-                        "response": "⏱️ Request timed out. The HF Space might be starting up (cold start takes ~30-60s). Try again!",
-                        "screenshot": ""
-                    }
-                    
-                except Exception as e:
-                    print(f"  Endpoint {endpoint} failed: {e}")
-                    continue
-            
-            # If all Gradio endpoints failed, try the custom /api/chat as fallback
+        async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
             try:
-                print("Trying fallback /api/chat...")
+                # First, try to reset the browser if session is stale
+                # or if this is a new conversation
+                current_time = time.time()
+                session_stale = (current_time - self.last_request_time) > self.session_timeout
+                
+                # Try to call the Space API
+                # Based on your working screenshot, the endpoint seems to be /api/chat or similar
+                # Let's try multiple approaches
+                
+                # Approach 1: Try the custom API endpoint (what you had)
                 resp = await client.post(
                     f"{HF_SPACE_URL}/api/chat",
-                    json={"message": text},
+                    json={"message": text, "user_id": str(user_id) if user_id else "default"},
+                    timeout=90.0
+                )
+                
+                print(f"API Response Status: {resp.status_code}")
+                print(f"API Response Headers: {dict(resp.headers)}")
+                print(f"API Response Body (first 500 chars): {resp.text[:500]}")
+                
+                if resp.status_code == 200:
+                    try:
+                        data = resp.json()
+                        self.last_request_time = current_time
+                        return data
+                    except:
+                        # Not JSON, maybe it's text
+                        return {"response": resp.text, "screenshot": ""}
+                else:
+                    # Try alternative endpoints
+                    return await self._try_alternative_endpoints(client, text, user_id)
+                    
+            except httpx.TimeoutException:
+                return {
+                    "response": "⏱️ Request timed out. The HF Space might be waking up from sleep (cold start takes ~30-60s). Please try again!",
+                    "screenshot": ""
+                }
+            except Exception as e:
+                import traceback
+                error_detail = traceback.format_exc()
+                print(f"Error in forward_to_hf: {error_detail}")
+                return {
+                    "response": f"❌ Error connecting to HF Space: {str(e)[:200]}",
+                    "screenshot": ""
+                }
+
+    async def _try_alternative_endpoints(self, client, text, user_id):
+        """Try different API endpoints if the main one fails."""
+        endpoints_to_try = [
+            ("/api/predict", {"data": [text]}),
+            ("/gradio_api/call/predict", {"data": [text]}),
+            ("/predict", {"message": text}),
+            ("/chat", {"message": text}),
+        ]
+        
+        for endpoint, payload in endpoints_to_try:
+            try:
+                print(f"Trying alternative endpoint: {endpoint}")
+                resp = await client.post(
+                    f"{HF_SPACE_URL}{endpoint}",
+                    json=payload,
                     timeout=30.0
                 )
-                print(f"  /api/chat status: {resp.status_code}")
-                print(f"  /api/chat body: {resp.text[:500]}")
-                
                 if resp.status_code == 200:
                     try:
                         return resp.json()
                     except:
                         return {"response": resp.text, "screenshot": ""}
-                else:
-                    return {
-                        "response": f"❌ HF Space returned {resp.status_code}. The Space might be asleep or the endpoint doesn't exist.\n\nBody: {resp.text[:300]}",
-                        "screenshot": ""
-                    }
             except Exception as e:
-                return {
-                    "response": f"❌ All endpoints failed. Last error: {str(e)}",
-                    "screenshot": ""
-                }
-
-    async def forward_to_hf(self, text: str) -> dict:
-        """Forward message to HF Space with proper error handling."""
-        try:
-            return await self.gradio_predict(text)
-        except Exception as e:
-            import traceback
-            print(f"forward_to_hf error: {traceback.format_exc()}")
-            return {"response": f"❌ Error: {str(e)}", "screenshot": ""}
+                print(f"  {endpoint} failed: {e}")
+                continue
+        
+        return {
+            "response": "❌ Could not connect to HF Space. All endpoints failed.",
+            "screenshot": ""
+        }
 
     async def start_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         welcome = """🤖 *AI Agent Browser Bot*
@@ -198,7 +149,7 @@ Or just send me any message!"""
         await update.message.chat.send_action(action="typing")
         msg = await update.message.reply_text(f"🌐 Browsing {url}...")
 
-        result = await self.forward_to_hf(f"Go to {url} and summarize what you see")
+        result = await self.forward_to_hf(f"Go to {url} and summarize what you see", update.effective_user.id)
         await self._send_result(update, msg, result, f"🌐 {url[:50]}")
 
     async def search_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -210,42 +161,44 @@ Or just send me any message!"""
         await update.message.chat.send_action(action="typing")
         msg = await update.message.reply_text(f"🔍 Searching: {query}...")
 
-        result = await self.forward_to_hf(f"Search for {query}")
+        result = await self.forward_to_hf(f"Search for {query}", update.effective_user.id)
         await self._send_result(update, msg, result, f"🔍 {query}")
 
     async def screenshot_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.chat.send_action(action="upload_photo")
         msg = await update.message.reply_text("📸 Getting screenshot...")
 
-        result = await self.forward_to_hf("Take a screenshot of the current page")
+        result = await self.forward_to_hf("Take a screenshot of the current page", update.effective_user.id)
         await self._send_result(update, msg, result, "📸 Screenshot")
 
     async def status_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         async with httpx.AsyncClient(timeout=10.0) as client:
             try:
-                # Try Gradio health first
-                resp = await client.get(f"{HF_SPACE_URL}/gradio_api/heartbeat", timeout=10.0)
-                if resp.status_code == 200:
-                    await update.message.reply_text("🤖 *HF Space Status*\n\n✅ Online (Gradio API)", parse_mode="Markdown")
-                    return
-            except:
-                pass
-            
-            try:
-                resp = await client.get(f"{HF_SPACE_URL}/health", timeout=10.0)
-                data = resp.json()
-                status = "✅ Online" if data.get("status") == "ok" else "❌ Issue"
-                browser = "🟢 Active" if data.get("browser_active") else "🔴 Inactive"
-                await update.message.reply_text(f"🤖 *HF Space Status*\n\n{status}\n🌐 Browser: {browser}", parse_mode="Markdown")
+                # Try multiple health endpoints
+                for endpoint in ["/health", "/gradio_api/heartbeat", "/"]:
+                    try:
+                        resp = await client.get(f"{HF_SPACE_URL}{endpoint}", timeout=5.0)
+                        if resp.status_code == 200:
+                            await update.message.reply_text(
+                                f"🤖 *HF Space Status*\n\n✅ Online (responded to {endpoint})",
+                                parse_mode="Markdown"
+                            )
+                            return
+                    except:
+                        continue
+                        
+                await update.message.reply_text("❌ HF Space unreachable", parse_mode="Markdown")
             except Exception as e:
                 await update.message.reply_text(f"❌ HF Space unreachable:\n```\n{str(e)[:200]}\n```", parse_mode="Markdown")
 
     async def handle_msg(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = update.message.text
+        user_id = update.effective_user.id
+        
         await update.message.chat.send_action(action="typing")
         msg = await update.message.reply_text("🤔 Thinking...")
 
-        result = await self.forward_to_hf(text)
+        result = await self.forward_to_hf(text, user_id)
 
         keyboard = [[InlineKeyboardButton("🌐 Browse for this", callback_data=f"browse:{text[:100]}")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -261,19 +214,30 @@ Or just send me any message!"""
             search_query = data[7:]
             await query.edit_message_text(f"🌐 Browsing: {search_query}...")
 
-            result = await self.forward_to_hf(search_query)
+            result = await self.forward_to_hf(search_query, update.effective_user.id)
             await self._send_result_to_query(query, result, f"🌐 {search_query[:50]}")
 
     async def _send_result(self, update: Update, msg, result: dict, header: str, reply_markup=None):
         response = result.get("response", "No response")
         screenshot = result.get("screenshot", "")
+        
+        # Handle case where response might be nested
+        if not response and "data" in result:
+            response = str(result["data"])
+        if not response and "output" in result:
+            response = str(result["output"])
 
-        # Ensure response is a string
+        # Ensure response is string
         if not isinstance(response, str):
             response = str(response)
 
-        if screenshot and "," in screenshot:
+        # Clean up stale Wikipedia responses for non-wikipedia queries
+        if "wikipedia" in response.lower() and "wikipedia" not in header.lower() and "wikipedia" not in str(getattr(update, 'message', {}).get('text', '') if hasattr(update, 'message') else '').lower():
+            response = "⚠️ The agent returned a stale response. The browser may still have Wikipedia loaded from a previous session.\n\nTry: /browse <new-url> to navigate elsewhere first."
+
+        if screenshot and isinstance(screenshot, str) and "," in screenshot:
             try:
+                # Handle base64 data URL format: data:image/png;base64,...
                 img_data = base64.b64decode(screenshot.split(",")[1])
                 await msg.delete()
                 await update.message.reply_photo(
@@ -283,25 +247,26 @@ Or just send me any message!"""
                     parse_mode="Markdown"
                 )
             except Exception as e:
+                print(f"Screenshot error: {e}")
                 try:
-                    await msg.edit_text(f"{header}\n\n{response[:3000]}\n\n⚠️ Screenshot error: {str(e)[:100]}", parse_mode="Markdown")
+                    await msg.edit_text(f"{header}\n\n{response[:3000]}\n\n⚠️ Screenshot error", parse_mode="Markdown")
                 except:
-                    await update.message.reply_text(f"{header}\n\n{response[:3000]}", parse_mode="Markdown")
+                    await update.message.reply_text(f"{header}\n\n{response[:3000]}", reply_markup=reply_markup)
         else:
             try:
                 await msg.edit_text(f"{header}\n\n{response[:3000]}", reply_markup=reply_markup, parse_mode="Markdown")
             except Exception as e:
-                # If edit fails, send new message
-                await update.message.reply_text(f"{header}\n\n{response[:3000]}", reply_markup=reply_markup, parse_mode="Markdown")
+                print(f"Edit message error: {e}")
+                await update.message.reply_text(f"{header}\n\n{response[:3000]}", reply_markup=reply_markup)
 
     async def _send_result_to_query(self, query, result: dict, header: str):
         response = result.get("response", "No response")
         screenshot = result.get("screenshot", "")
-
+        
         if not isinstance(response, str):
             response = str(response)
 
-        if screenshot and "," in screenshot:
+        if screenshot and isinstance(screenshot, str) and "," in screenshot:
             try:
                 img_data = base64.b64decode(screenshot.split(",")[1])
                 await query.message.reply_photo(
@@ -332,17 +297,11 @@ Or just send me any message!"""
         print(f"🤖 Bot worker starting...")
         print(f"🔗 HF Space: {HF_SPACE_URL}")
 
-        # Test connection to HF Space
-        print("🔍 Testing HF Space connection...")
-        test_result = await self.forward_to_hf("Hello")
-        print(f"Test result: {test_result.get('response', 'No response')[:200]}")
-
         await self.app.initialize()
         await self.app.start()
         await self.app.updater.start_polling(drop_pending_updates=True)
 
         print("✅ Bot polling started")
-        # Keep running
         while True:
             await asyncio.sleep(3600)
 
@@ -362,11 +321,9 @@ def run_bot():
         loop.close()
 
 if __name__ == "__main__":
-    # Start bot in background thread
     bot_thread = threading.Thread(target=run_bot, daemon=True)
     bot_thread.start()
     print("🤖 Bot thread started")
 
-    # Start Flask server for Render health check
     print(f"🌐 Starting health server on port {PORT}")
     flask_app.run(host="0.0.0.0", port=PORT, threaded=True)
