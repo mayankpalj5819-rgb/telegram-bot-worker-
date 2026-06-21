@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: telegram-bot-worker
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot_worker.py
+    plan: free
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false  # Set in Render dashboard
+      - key: HF_SPACE_URL
+        value: https://mayank2028-agent.hf.space
+    # IMPORTANT: Only run ONE instance
+    numInstances: 1
